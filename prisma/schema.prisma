@@ -1,0 +1,188 @@
+// Casa (Miraflores) PMS — data model
+//
+// The single most important integrity rule of a PMS — "no two overlapping
+// reservations in the same room" — is NOT enforced in application code alone.
+// A raw-SQL migration adds a Postgres GiST EXCLUDE constraint on
+// (room_id, daterange(check_in, check_out)) for active reservations. See
+// prisma/migrations/*/exclusion_constraint.sql. Postgres is therefore required.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum Role {
+  OWNER
+  FRONT_DESK
+  HOUSEKEEPING
+}
+
+enum RoomStatus {
+  ACTIVE
+  OUT_OF_ORDER
+}
+
+// Live housekeeping state of the physical room.
+enum HousekeepingStatus {
+  CLEAN
+  DIRTY
+  CLEANING
+  INSPECTED
+}
+
+enum ReservationStatus {
+  CONFIRMED
+  CHECKED_IN
+  CHECKED_OUT
+  CANCELLED
+  NO_SHOW
+}
+
+// Kept as a flexible string-backed enum so Phase 2 (direct booking) and
+// Phase 3 (channel manager) can add sources without a schema rewrite.
+enum ReservationSource {
+  WALK_IN
+  PHONE
+  EMAIL
+  BOOKING_COM
+  EXPEDIA
+  DIRECT
+  OTHER
+}
+
+enum PaymentStatus {
+  PAID
+  PAY_AT_CHECKOUT
+  OTA_PREPAID
+}
+
+model User {
+  id           String   @id @default(cuid())
+  email        String   @unique
+  passwordHash String
+  name         String
+  role         Role
+  active       Boolean  @default(true)
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  createdReservations Reservation[] @relation("ReservationCreatedBy")
+  auditLogs           AuditLog[]
+}
+
+model Room {
+  id                 String             @id @default(cuid())
+  number             String             @unique
+  type               String // double | twin | suite | ...
+  floor              Int
+  maxOccupancy       Int
+  baseRate           Decimal            @db.Decimal(10, 2)
+  amenities          String[] // e.g. ["wifi", "balcony", "ac"]
+  status             RoomStatus         @default(ACTIVE)
+  housekeepingStatus HousekeepingStatus @default(CLEAN)
+  housekeepingNote   String?
+  createdAt          DateTime           @default(now())
+  updatedAt          DateTime           @updatedAt
+
+  reservations Reservation[]
+  outOfOrder   RoomOutOfOrder[]
+
+  @@index([status])
+}
+
+// A date range in which a room cannot be sold (maintenance, renovation).
+// checkOut/end is exclusive, matching reservation semantics.
+model RoomOutOfOrder {
+  id        String   @id @default(cuid())
+  roomId    String
+  room      Room     @relation(fields: [roomId], references: [id], onDelete: Cascade)
+  startDate DateTime @db.Date
+  endDate   DateTime @db.Date
+  reason    String
+  createdAt DateTime @default(now())
+
+  @@index([roomId])
+}
+
+model Reservation {
+  id            String            @id @default(cuid())
+  room          Room              @relation(fields: [roomId], references: [id])
+  roomId        String
+  guestName     String
+  guestEmail    String?
+  guestPhone    String?
+  // Nights are [checkIn, checkOut): a guest occupying Jul 10 -> Jul 12
+  // stays two nights and the room is free again from Jul 12.
+  checkIn       DateTime          @db.Date
+  checkOut      DateTime          @db.Date
+  adults        Int               @default(1)
+  children      Int               @default(0)
+  ratePerNight  Decimal           @db.Decimal(10, 2)
+  source        ReservationSource @default(WALK_IN)
+  status        ReservationStatus @default(CONFIRMED)
+  paymentStatus PaymentStatus     @default(PAY_AT_CHECKOUT)
+  notes         String?
+
+  // Populated at staff check-in.
+  checkedInAt  DateTime?
+  checkedOutAt DateTime?
+
+  createdById String?
+  createdBy   User?   @relation("ReservationCreatedBy", fields: [createdById], references: [id])
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  checkInToken CheckInToken?
+  guestCheckIn GuestCheckIn?
+
+  @@index([roomId])
+  @@index([status])
+  @@index([checkIn])
+  @@index([checkOut])
+}
+
+// Signed, expiring token that lets a guest self-check-in without an account.
+model CheckInToken {
+  id            String      @id @default(cuid())
+  reservationId String      @unique
+  reservation   Reservation @relation(fields: [reservationId], references: [id], onDelete: Cascade)
+  token         String      @unique
+  expiresAt     DateTime
+  usedAt        DateTime?
+  createdAt     DateTime    @default(now())
+}
+
+// Data captured during guest online check-in.
+model GuestCheckIn {
+  id            String      @id @default(cuid())
+  reservationId String      @unique
+  reservation   Reservation @relation(fields: [reservationId], references: [id], onDelete: Cascade)
+  arrivalTime   String? // free text, e.g. "18:30" or "late evening"
+  actualGuests  Int?
+  // Path to the encrypted ID image on disk. Purged 30 days after checkout by
+  // the retention job (scripts/purge-id-uploads.ts).
+  idImagePath   String?
+  idImagePurgedAt DateTime?
+  signatureName String? // typed signature for the registration form
+  signedAt      DateTime?
+  completedAt   DateTime    @default(now())
+}
+
+model AuditLog {
+  id         String   @id @default(cuid())
+  userId     String?
+  user       User?    @relation(fields: [userId], references: [id])
+  action     String // e.g. "reservation.create", "reservation.checkin"
+  entityType String // e.g. "Reservation", "Room"
+  entityId   String
+  details    Json?
+  createdAt  DateTime @default(now())
+
+  @@index([entityType, entityId])
+  @@index([createdAt])
+}
